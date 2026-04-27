@@ -32,11 +32,6 @@ async function start() {
 
   sock.ev.on("creds.update", saveCreds);
 
-  // Debug: log every event type so we can see what Baileys is emitting
-  sock.ev.on("messages.upsert", ({ type }) => {
-    log.info({ type }, "🔔 messages.upsert raw event");
-  });
-
   sock.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
     if (qr) {
       qrcode.generate(qr, { small: true });
@@ -64,21 +59,17 @@ async function start() {
     if (type !== "notify") return;
 
     for (const msg of messages) {
-      const jid = msg.key.remoteJid ?? "unknown";
-      log.info(
-        { jid, fromMe: msg.key.fromMe, hasMsg: !!msg.message },
-        "🔍 processing message"
-      );
-
-      if (msg.key.fromMe) { log.info({ jid }, "⏭ skipped: fromMe"); continue; }
-      if (!msg.message)   { log.info({ jid }, "⏭ skipped: no message body"); continue; }
+      const jid = msg.key.remoteJid;
+      if (!jid) continue;
+      if (msg.key.fromMe) continue;
+      if (!msg.message) continue;
 
       const text =
         msg.message.conversation ??
         msg.message.extendedTextMessage?.text ??
         "";
 
-      if (!text.trim()) { log.info({ jid }, "⏭ skipped: empty text"); continue; }
+      if (!text.trim()) continue;
 
       try {
         if (isJidUser(jid) || isLidUser(jid)) {
