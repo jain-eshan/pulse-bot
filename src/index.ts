@@ -1,4 +1,5 @@
 import "dotenv/config";
+import http from "http";
 import {
   makeWASocket,
   useMultiFileAuthState,
@@ -10,11 +11,53 @@ import {
 import type { Boom } from "@hapi/boom";
 import qrcode from "qrcode-terminal";
 import QRCode from "qrcode";
-import fs from "fs";
 import path from "path";
 import { log } from "./lib/logger.js";
 import { handleDm } from "./handlers/dmCommand.js";
 import { handleGroupMessage } from "./handlers/groupMessage.js";
+
+// ── QR HTTP server ──────────────────────────────────────────────────────────
+// Railway kills containers that don't bind a port. This server:
+//   • Keeps the process alive so Railway doesn't restart it mid-QR
+//   • Serves the QR as a scannable page at GET /qr
+let currentQrDataUrl: string | null = null;
+let botConnected = false;
+
+const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
+
+http.createServer(async (req, res) => {
+  if (req.url === "/qr") {
+    if (botConnected) {
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end("<h2 style='font-family:sans-serif;color:green'>✅ Bot is connected to WhatsApp</h2>");
+      return;
+    }
+    if (!currentQrDataUrl) {
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end(`<html><head><meta http-equiv="refresh" content="3"></head><body style="font-family:sans-serif"><p>⏳ Waiting for QR code… (auto-refreshes)</p></body></html>`);
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "text/html" });
+    res.end(`<!DOCTYPE html><html><head>
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      <meta http-equiv="refresh" content="30">
+      <title>Pulse Bot — Scan QR</title>
+      <style>body{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#111;color:#fff;font-family:sans-serif;}img{width:300px;height:300px;border-radius:12px;background:#fff;padding:16px;}p{opacity:.6;font-size:14px;}</style>
+    </head><body>
+      <h2>Scan with WhatsApp</h2>
+      <img src="${currentQrDataUrl}" alt="QR Code"/>
+      <p>Open WhatsApp → Linked Devices → Link a Device → scan above</p>
+      <p>Auto-refreshes every 30s</p>
+    </body></html>`);
+    return;
+  }
+  // Health check
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end(botConnected ? "ok — connected" : "ok — waiting for QR");
+}).listen(PORT, () => {
+  log.info(`QR server listening on port ${PORT} — visit /qr to scan`);
+});
+// ────────────────────────────────────────────────────────────────────────────
 
 async function start() {
   const { state, saveCreds } = await useMultiFileAuthState("auth");
@@ -37,13 +80,15 @@ async function start() {
 
   sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
     if (qr) {
+      // Terminal QR (local dev)
       qrcode.generate(qr, { small: true });
-      // Also save as PNG so you can scan it on your phone
-      const qrPath = path.resolve("qr.png");
-      await QRCode.toFile(qrPath, qr, { scale: 8, margin: 2 });
-      log.info(`Scan the QR code above with WhatsApp — or open: ${qrPath}`);
-      // Auto-open the PNG on macOS only (not on Railway/Linux)
+      // Data URL for the HTTP /qr page (Railway)
+      currentQrDataUrl = await QRCode.toDataURL(qr, { scale: 8, margin: 2 });
+      log.info(`QR ready — visit /qr on your Railway URL to scan`);
+      // Also save PNG + auto-open on macOS (local dev)
       if (process.platform === "darwin") {
+        const qrPath = path.resolve("qr.png");
+        await QRCode.toFile(qrPath, qr, { scale: 8, margin: 2 });
         const { exec } = (await import("child_process"));
         exec(`open "${qrPath}"`);
       }
@@ -62,6 +107,8 @@ async function start() {
     }
 
     if (connection === "open") {
+      botConnected = true;
+      currentQrDataUrl = null;
       log.info("✅ Pulse Bot connected to WhatsApp");
     }
   });
