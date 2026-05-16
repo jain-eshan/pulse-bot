@@ -9,6 +9,9 @@ import {
 } from "@whiskeysockets/baileys";
 import type { Boom } from "@hapi/boom";
 import qrcode from "qrcode-terminal";
+import QRCode from "qrcode";
+import fs from "fs";
+import path from "path";
 import { log } from "./lib/logger.js";
 import { handleDm } from "./handlers/dmCommand.js";
 import { handleGroupMessage } from "./handlers/groupMessage.js";
@@ -32,10 +35,18 @@ async function start() {
 
   sock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
+  sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
     if (qr) {
       qrcode.generate(qr, { small: true });
-      log.info("Scan the QR code above with WhatsApp");
+      // Also save as PNG so you can scan it on your phone
+      const qrPath = path.resolve("qr.png");
+      await QRCode.toFile(qrPath, qr, { scale: 8, margin: 2 });
+      log.info(`Scan the QR code above with WhatsApp — or open: ${qrPath}`);
+      // Auto-open the PNG on macOS only (not on Railway/Linux)
+      if (process.platform === "darwin") {
+        const { exec } = (await import("child_process"));
+        exec(`open "${qrPath}"`);
+      }
     }
 
     if (connection === "close") {
