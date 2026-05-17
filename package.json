@@ -12,6 +12,7 @@
     "cron:reminders": "tsx src/cron/reminders.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.96.0",
     "@hapi/boom": "^10.0.1",
     "@supabase/supabase-js": "^2.103.3",
     "@types/qrcode": "^1.5.6",

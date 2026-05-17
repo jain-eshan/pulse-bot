@@ -53,7 +53,7 @@ export async function sendWaEvent(
       `🕘 ${label} IST`,
       payload.venue ? `📍 ${payload.venue}` : null,
       payload.description ? `\n${payload.description}` : null,
-      "\nRSVP: pulse.eshanjain.in",
+      "\nRSVP: https://pulse-isb.vercel.app",
     ]
       .filter(Boolean)
       .join("\n");

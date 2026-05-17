@@ -1,8 +1,70 @@
 import type { WASocket, proto } from "@whiskeysockets/baileys";
+import { downloadMediaMessage } from "@whiskeysockets/baileys";
 import { supabase } from "../lib/supabase.js";
 import { looksLikeSessionAnnouncement } from "../lib/parser.js";
 import { parseSession, type ParsedSession } from "../lib/claude.js";
 import { log } from "../lib/logger.js";
+import crypto from "crypto";
+
+const APP_URL = "https://pulse-isb.vercel.app";
+const TTL_MS = 15 * 60 * 1000; // 15 minutes
+
+// ── Image helpers ────────────────────────────────────────────────────────────
+
+async function extractImageUrl(
+  sock: WASocket,
+  msg: proto.IWebMessageInfo
+): Promise<string | null> {
+  const imageMsg =
+    msg.message?.imageMessage ??
+    msg.message?.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage;
+
+  if (!imageMsg) return null;
+
+  try {
+    const buffer = await downloadMediaMessage(
+      msg,
+      "buffer",
+      {},
+      { logger: log.child({ module: "download" }) as any, reuploadRequest: sock.updateMediaMessage }
+    ) as Buffer;
+
+    const filename = `wa-covers/${Date.now()}-${crypto.randomBytes(4).toString("hex")}.jpg`;
+    const { data, error } = await supabase.storage
+      .from("session-covers")
+      .upload(filename, buffer, { contentType: "image/jpeg", upsert: false });
+
+    if (error || !data) {
+      log.warn({ error }, "Failed to upload WA image to Supabase Storage");
+      return null;
+    }
+
+    const { data: urlData } = supabase.storage.from("session-covers").getPublicUrl(data.path);
+    return urlData.publicUrl;
+  } catch (err) {
+    log.warn({ err }, "Image download/upload failed");
+    return null;
+  }
+}
+
+// ── Magic link for unlinked users ────────────────────────────────────────────
+
+async function createDraftLink(
+  parsed: ParsedSession,
+  imageUrl: string | null,
+  senderJid: string
+): Promise<string> {
+  const token = crypto.randomBytes(16).toString("hex");
+  await supabase.from("bot_event_drafts").insert({
+    token,
+    sender_jid: senderJid,
+    parsed_payload: { ...parsed, image_url: imageUrl ?? undefined },
+    expires_at: new Date(Date.now() + TTL_MS).toISOString(),
+  });
+  return `${APP_URL}/?draft=${token}`;
+}
+
+// ── Main handler ─────────────────────────────────────────────────────────────
 
 export async function handleGroupMessage(
   sock: WASocket,
@@ -15,8 +77,14 @@ export async function handleGroupMessage(
     msg.message?.extendedTextMessage?.text ??
     "";
 
-  if (!text) return;
-  if (!looksLikeSessionAnnouncement(text)) return;
+  // Allow image-only messages (caption may be empty) — check for image presence too
+  const hasImage = !!(
+    msg.message?.imageMessage ??
+    msg.message?.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage
+  );
+
+  if (!text && !hasImage) return;
+  if (text && !looksLikeSessionAnnouncement(text)) return;
 
   log.info({ groupJid, senderJid, preview: text.slice(0, 80) }, "📅 announcement detected");
 
@@ -29,24 +97,27 @@ export async function handleGroupMessage(
     log.warn({ err }, "failed to react with 📅");
   }
 
-  // 2. Parse with Claude
-  const parsed = await parseSession(text);
+  // 2. Download image if present (do in parallel with parse)
+  const [parsed, imageUrl] = await Promise.all([
+    parseSession(text),
+    extractImageUrl(sock, msg),
+  ]);
+
   if (!parsed) {
     log.info("parse-session returned null — skipping DM");
     return;
   }
 
-  // 3. Store pending confirmation (5 min TTL)
-  await supabase.from("bot_pending_confirms").upsert({
-    sender_jid: senderJid,
-    group_jid: groupJid,
-    source_text: text,
-    parsed_payload: parsed,
-    expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
-  });
+  if (imageUrl) {
+    parsed.image_url = imageUrl;
+  }
 
-  // 4. Look up sender — linked or not?
-  const senderId = senderJid.replace("@s.whatsapp.net", "").replace("@lid", "");
+  // 3. Look up sender — linked or not?
+  const senderId = senderJid
+    .replace("@s.whatsapp.net", "")
+    .replace("@lid", "")
+    .replace(/\D/g, "");
+
   const { data: linkedUser } = await supabase
     .from("users")
     .select("id, name")
@@ -54,12 +125,21 @@ export async function handleGroupMessage(
     .maybeSingle();
 
   if (linkedUser) {
-    // Linked path
+    // ── Linked path: store pending confirm, DM preview ──────────────────────
+    await supabase.from("bot_pending_confirms").upsert({
+      sender_jid: senderJid,
+      group_jid: groupJid,
+      source_text: text,
+      parsed_payload: { ...parsed, image_url: imageUrl ?? undefined },
+      expires_at: new Date(Date.now() + TTL_MS).toISOString(),
+    });
+
+    const firstName = (linkedUser.name ?? "there").split(" ")[0];
     await sock.sendMessage(senderJid, {
-      text: buildLinkedPreview(parsed, linkedUser.name ?? "there"),
+      text: buildLinkedPreview(parsed, firstName),
     });
   } else {
-    // Unlinked: pitch once, never again
+    // ── Unlinked path: magic link (pitch once per JID) ───────────────────────
     const { data: alreadyPitched } = await supabase
       .from("bot_dm_pitches")
       .select("jid")
@@ -71,6 +151,9 @@ export async function handleGroupMessage(
       return;
     }
 
+    // Store the draft so the web app can pre-fill the form
+    const draftUrl = await createDraftLink(parsed, imageUrl, senderJid);
+
     await supabase.from("bot_dm_pitches").insert({
       jid: senderJid,
       source_group_jid: groupJid,
@@ -78,40 +161,58 @@ export async function handleGroupMessage(
     });
 
     await sock.sendMessage(senderJid, {
-      text: buildUnlinkedPitch(parsed),
+      text: buildUnlinkedPitch(parsed, draftUrl),
     });
   }
 }
 
-function buildLinkedPreview(parsed: ParsedSession, name: string): string {
-  return [
-    `Hi ${name.split(" ")[0]}! 📅`,
-    "",
-    "Saw your message in the group. Want me to add it to Pulse?",
-    "",
-    `*${parsed.title || "(no title)"}*`,
-    parsed.starts_at ? `🕐 ${parsed.starts_at}` : null,
-    parsed.venue ? `📍 ${parsed.venue}` : null,
-    "",
-    "Reply *YES* to publish, *NO* to skip.",
-  ].filter(Boolean).join("\n");
+// ── Message builders ─────────────────────────────────────────────────────────
+
+function fmtTime(isoStr: string): string {
+  try {
+    return new Date(isoStr).toLocaleString("en-IN", {
+      timeZone: "Asia/Kolkata",
+      weekday: "short",
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return isoStr;
+  }
 }
 
-function buildUnlinkedPitch(parsed: ParsedSession): string {
-  return [
-    "Hi! 👋 I'm Pulse Bot.",
+function buildLinkedPreview(parsed: ParsedSession, firstName: string): string {
+  const lines = [
+    `Hey ${firstName}! 🎉 Spotted your event in the group.`,
     "",
-    "Your cohort uses me to track sessions. I noticed your message looks like an event:",
+    `*${parsed.title}*`,
+    parsed.starts_at ? `🕐 ${fmtTime(parsed.starts_at)}` : null,
+    parsed.venue ? `📍 ${parsed.venue}` : null,
+    parsed.description ? `\n_${parsed.description}_` : null,
     "",
-    `*${parsed.title || "(no title)"}*`,
+    "I can publish this to Pulse so everyone can RSVP — takes 2 seconds.",
+    "Reply *YES* to post it, *NO* to skip.",
+  ];
+  return lines.filter(Boolean).join("\n");
+}
+
+function buildUnlinkedPitch(parsed: ParsedSession, draftUrl: string): string {
+  const lines = [
+    "Hey! 👋 I'm Pulse, the campus events bot for ISB Mohali.",
+    "",
+    "Noticed your message in the group — sounds like an event!",
+    "",
+    `*${parsed.title}*`,
+    parsed.starts_at ? `🕐 ${fmtTime(parsed.starts_at)}` : null,
     parsed.venue ? `📍 ${parsed.venue}` : null,
     "",
-    "Want me to publish it?",
+    "Want to list it on Pulse so your cohort can RSVP? I've already filled in the details for you — just tap the link, sign in, and hit Publish:",
     "",
-    "1. Visit pulse.eshanjain.in → Profile",
-    "2. Tap *Generate link code*",
-    "3. Reply here: `link 123456`",
+    draftUrl,
     "",
-    "Then reply *YES* and I'll publish it.",
-  ].filter(Boolean).join("\n");
+    "Takes 30 seconds. Your event, your cohort — sorted. 🚀",
+  ];
+  return lines.filter(Boolean).join("\n");
 }
