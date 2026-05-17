@@ -25,6 +25,15 @@ let reconnectAttempts = 0;
 let watchdogTimer: ReturnType<typeof setInterval> | null = null;
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
+
+// Log env var presence at startup so we can diagnose Railway variable issues
+log.info({
+  hasParseUrl: !!process.env.ANTHROPIC_PARSE_URL,
+  hasParseKey: !!process.env.ANTHROPIC_PARSE_KEY,
+  hasSupabaseUrl: !!process.env.SUPABASE_URL,
+  hasSupabaseKey: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
+  parseUrlPrefix: process.env.ANTHROPIC_PARSE_URL?.slice(0, 30) ?? "(not set)",
+}, "🔑 Environment check at startup");
 // Watchdog: if connected but no WA activity for 5 min, assume zombie → reconnect
 const WATCHDOG_INTERVAL_MS = 60_000;       // check every 60s
 const ZOMBIE_THRESHOLD_MS  = 5 * 60_000;  // 5 min silence = zombie
