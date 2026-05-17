@@ -120,13 +120,25 @@ async function start() {
   });
 
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    if (type !== "notify") return;
+    // "notify" = live incoming message
+    // "append" = history sync — only process if message is very recent (within 3 min)
+    //   so we don't miss messages sent while the bot was reconnecting
+    if (type !== "notify" && type !== "append") return;
+
+    const now = Date.now();
+    const RECENT_MS = 3 * 60 * 1000; // 3 minutes
 
     for (const msg of messages) {
       const jid = msg.key.remoteJid;
       if (!jid) continue;
       if (msg.key.fromMe) continue;
       if (!msg.message) continue;
+
+      // For history-sync messages, skip if older than 3 minutes
+      if (type === "append") {
+        const msgTs = (msg.messageTimestamp as number ?? 0) * 1000;
+        if (now - msgTs > RECENT_MS) continue;
+      }
 
       const text =
         msg.message.conversation ??
