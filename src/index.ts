@@ -60,6 +60,14 @@ http.createServer(async (req, res) => {
 });
 // ────────────────────────────────────────────────────────────────────────────
 
+// Exponential back-off for reconnects (ms): 5s → 10s → 20s → 40s → max 60s
+let reconnectAttempts = 0;
+function scheduleReconnect(delaySecs: number) {
+  const ms = delaySecs * 1000;
+  log.info({ delaySecs }, `Reconnecting in ${delaySecs}s…`);
+  setTimeout(() => { reconnectAttempts++; start(); }, ms);
+}
+
 async function start() {
   // On Railway: persist session to Supabase so restarts don't require re-scanning QR.
   // Locally (no SUPABASE_URL): fall back to local auth/ folder.
@@ -102,19 +110,37 @@ async function start() {
 
     if (connection === "close") {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      log.warn({ statusCode, shouldReconnect }, "Connection closed");
-      if (shouldReconnect) {
-        setTimeout(start, 5000);
+      botConnected = false;
+      log.warn({ statusCode }, "Connection closed");
+
+      if (statusCode === DisconnectReason.loggedOut) {
+        // Fully logged out — need a fresh QR scan
+        log.error("Logged out — re-scan QR at /qr");
+        reconnectAttempts = 0;
+        scheduleReconnect(3);
+
+      } else if (statusCode === DisconnectReason.connectionReplaced) {
+        // 440: Another instance connected with same session (Railway rolling deploy overlap).
+        // Wait 60s — the competing container will be terminated by Railway by then.
+        log.warn("Connection replaced by another instance — waiting 60s before reconnecting");
+        reconnectAttempts = 0;
+        scheduleReconnect(60);
+
+      } else if (statusCode === DisconnectReason.restartRequired) {
+        // 515: Server asked us to restart
+        scheduleReconnect(5);
+
       } else {
-        log.error("Logged out — delete auth/ folder and restart to re-scan QR");
-        process.exit(1);
+        // Any other disconnect — exponential back-off capped at 60s
+        const delay = Math.min(5 * Math.pow(2, reconnectAttempts), 60);
+        scheduleReconnect(delay);
       }
     }
 
     if (connection === "open") {
       botConnected = true;
       currentQrDataUrl = null;
+      reconnectAttempts = 0;
       log.info("✅ Pulse Bot connected to WhatsApp");
     }
   });
