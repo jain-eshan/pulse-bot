@@ -8,6 +8,7 @@ import {
   isJidUser,
   isLidUser,
 } from "@whiskeysockets/baileys";
+import { useSupabaseAuthState } from "./lib/supabaseAuthState.js";
 import type { Boom } from "@hapi/boom";
 import qrcode from "qrcode-terminal";
 import QRCode from "qrcode";
@@ -60,7 +61,12 @@ http.createServer(async (req, res) => {
 // ────────────────────────────────────────────────────────────────────────────
 
 async function start() {
-  const { state, saveCreds } = await useMultiFileAuthState("auth");
+  // On Railway: persist session to Supabase so restarts don't require re-scanning QR.
+  // Locally (no SUPABASE_URL): fall back to local auth/ folder.
+  const { state, saveCreds } = process.env.SUPABASE_URL
+    ? await useSupabaseAuthState()
+    : await useMultiFileAuthState("auth");
+
   const { version } = await fetchLatestBaileysVersion();
 
   log.info({ version }, "Starting Pulse Bot");
