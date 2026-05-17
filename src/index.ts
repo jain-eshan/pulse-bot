@@ -189,13 +189,24 @@ async function start() {
         if (now - msgTs > RECENT_MS) continue;
       }
 
+      const m = msg.message;
       const text =
-        msg.message.conversation ??
-        msg.message.extendedTextMessage?.text ??
+        m.conversation ??
+        m.extendedTextMessage?.text ??
+        m.imageMessage?.caption ??
+        m.videoMessage?.caption ??
+        m.documentMessage?.caption ??
+        m.ephemeralMessage?.message?.conversation ??
+        m.ephemeralMessage?.message?.extendedTextMessage?.text ??
+        m.viewOnceMessage?.message?.conversation ??
+        m.viewOnceMessage?.message?.extendedTextMessage?.text ??
+        m.editedMessage?.message?.protocolMessage?.editedMessage?.conversation ??
+        m.editedMessage?.message?.protocolMessage?.editedMessage?.extendedTextMessage?.text ??
         "";
 
-      // Log every message we see (first 80 chars) — helps trace drops
-      log.info({ jid: jid.slice(-20), type, textLen: text.length, preview: text.slice(0, 80) }, "👁 message seen");
+      // Log every message — if textLen=0, also dump message keys so we can diagnose
+      const msgKeys = Object.keys(m).join(",");
+      log.info({ jid: jid.slice(-20), type, textLen: text.length, msgKeys, preview: text.slice(0, 80) }, "👁 message seen");
 
       if (!text.trim()) continue;
 
