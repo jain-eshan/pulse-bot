@@ -17,15 +17,19 @@ import { log } from "./lib/logger.js";
 import { handleDm } from "./handlers/dmCommand.js";
 import { handleGroupMessage } from "./handlers/groupMessage.js";
 
-// ── QR HTTP server ──────────────────────────────────────────────────────────
-// Railway kills containers that don't bind a port. This server:
-//   • Keeps the process alive so Railway doesn't restart it mid-QR
-//   • Serves the QR as a scannable page at GET /qr
+// ── State ────────────────────────────────────────────────────────────────────
 let currentQrDataUrl: string | null = null;
 let botConnected = false;
+let lastEventAt: number = Date.now(); // tracks last WA activity (message or ping)
+let reconnectAttempts = 0;
+let watchdogTimer: ReturnType<typeof setInterval> | null = null;
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
+// Watchdog: if connected but no WA activity for 5 min, assume zombie → reconnect
+const WATCHDOG_INTERVAL_MS = 60_000;       // check every 60s
+const ZOMBIE_THRESHOLD_MS  = 5 * 60_000;  // 5 min silence = zombie
 
+// ── HTTP server ───────────────────────────────────────────────────────────────
 http.createServer(async (req, res) => {
   if (req.url === "/qr") {
     if (botConnected) {
@@ -52,31 +56,52 @@ http.createServer(async (req, res) => {
     </body></html>`);
     return;
   }
-  // Health check
+
+  if (req.url === "/status") {
+    const silenceSecs = Math.round((Date.now() - lastEventAt) / 1000);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      connected: botConnected,
+      lastEventSecsAgo: silenceSecs,
+      reconnectAttempts,
+    }));
+    return;
+  }
+
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end(botConnected ? "ok — connected" : "ok — waiting for QR");
 }).listen(PORT, () => {
-  log.info(`QR server listening on port ${PORT} — visit /qr to scan`);
+  log.info(`HTTP server on port ${PORT} — /qr to scan, /status for diagnostics`);
 });
-// ────────────────────────────────────────────────────────────────────────────
 
-// Exponential back-off for reconnects (ms): 5s → 10s → 20s → 40s → max 60s
-let reconnectAttempts = 0;
+// ── Reconnect helpers ─────────────────────────────────────────────────────────
 function scheduleReconnect(delaySecs: number) {
-  const ms = delaySecs * 1000;
-  log.info({ delaySecs }, `Reconnecting in ${delaySecs}s…`);
-  setTimeout(() => { reconnectAttempts++; start(); }, ms);
+  log.info({ delaySecs, reconnectAttempts }, `Reconnecting in ${delaySecs}s…`);
+  setTimeout(() => { reconnectAttempts++; start(); }, delaySecs * 1000);
 }
 
+function startWatchdog(sock: ReturnType<typeof makeWASocket>) {
+  if (watchdogTimer) clearInterval(watchdogTimer);
+  watchdogTimer = setInterval(() => {
+    if (!botConnected) return;
+    const silenceMs = Date.now() - lastEventAt;
+    if (silenceMs > ZOMBIE_THRESHOLD_MS) {
+      log.warn({ silenceSecs: Math.round(silenceMs / 1000) }, "⚠️ Zombie connection detected — forcing reconnect");
+      botConnected = false;
+      try { sock.end(undefined); } catch { /* ignore */ }
+      if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; }
+      scheduleReconnect(5);
+    }
+  }, WATCHDOG_INTERVAL_MS);
+}
+
+// ── Main bot ──────────────────────────────────────────────────────────────────
 async function start() {
-  // On Railway: persist session to Supabase so restarts don't require re-scanning QR.
-  // Locally (no SUPABASE_URL): fall back to local auth/ folder.
   const { state, saveCreds } = process.env.SUPABASE_URL
     ? await useSupabaseAuthState()
     : await useMultiFileAuthState("auth");
 
   const { version } = await fetchLatestBaileysVersion();
-
   log.info({ version }, "Starting Pulse Bot");
 
   const sock = makeWASocket({
@@ -84,22 +109,19 @@ async function start() {
     auth: state,
     printQRInTerminal: false,
     logger: log.child({ module: "baileys" }) as any,
-    // Disable per-query timeout — prevents fetchProps from killing init
     defaultQueryTimeoutMs: undefined,
-    // Keep socket alive aggressively
     keepAliveIntervalMs: 15_000,
   });
 
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
+    lastEventAt = Date.now(); // any connection event counts as activity
+
     if (qr) {
-      // Terminal QR (local dev)
       qrcode.generate(qr, { small: true });
-      // Data URL for the HTTP /qr page (Railway)
       currentQrDataUrl = await QRCode.toDataURL(qr, { scale: 8, margin: 2 });
-      log.info(`QR ready — visit /qr on your Railway URL to scan`);
-      // Also save PNG + auto-open on macOS (local dev)
+      log.info("QR ready — visit /qr on your Railway URL to scan");
       if (process.platform === "darwin") {
         const qrPath = path.resolve("qr.png");
         await QRCode.toFile(qrPath, qr, { scale: 8, margin: 2 });
@@ -108,51 +130,53 @@ async function start() {
       }
     }
 
+    if (connection === "open") {
+      botConnected = true;
+      currentQrDataUrl = null;
+      reconnectAttempts = 0;
+      lastEventAt = Date.now();
+      log.info("✅ Pulse Bot connected to WhatsApp");
+      startWatchdog(sock);
+    }
+
     if (connection === "close") {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       botConnected = false;
+      if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; }
       log.warn({ statusCode }, "Connection closed");
 
       if (statusCode === DisconnectReason.loggedOut) {
-        // Fully logged out — need a fresh QR scan
         log.error("Logged out — re-scan QR at /qr");
         reconnectAttempts = 0;
         scheduleReconnect(3);
 
       } else if (statusCode === DisconnectReason.connectionReplaced) {
-        // 440: Another instance connected with same session (Railway rolling deploy overlap).
-        // Wait 60s — the competing container will be terminated by Railway by then.
-        log.warn("Connection replaced by another instance — waiting 60s before reconnecting");
+        // 440: Railway rolling deploy — old+new container both connected.
+        // Wait 60s so the competing container gets killed first.
+        log.warn("Connection replaced — waiting 60s for old container to die");
         reconnectAttempts = 0;
         scheduleReconnect(60);
 
       } else if (statusCode === DisconnectReason.restartRequired) {
-        // 515: Server asked us to restart
         scheduleReconnect(5);
 
       } else {
-        // Any other disconnect — exponential back-off capped at 60s
         const delay = Math.min(5 * Math.pow(2, reconnectAttempts), 60);
         scheduleReconnect(delay);
       }
     }
-
-    if (connection === "open") {
-      botConnected = true;
-      currentQrDataUrl = null;
-      reconnectAttempts = 0;
-      log.info("✅ Pulse Bot connected to WhatsApp");
-    }
   });
 
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    // "notify" = live incoming message
-    // "append" = history sync — only process if message is very recent (within 3 min)
-    //   so we don't miss messages sent while the bot was reconnecting
+    lastEventAt = Date.now(); // keep watchdog fed
+
+    // "notify" = live message; "append" = history sync
     if (type !== "notify" && type !== "append") return;
 
     const now = Date.now();
-    const RECENT_MS = 3 * 60 * 1000; // 3 minutes
+    const RECENT_MS = 3 * 60 * 1000;
+
+    log.info({ type, count: messages.length }, "📩 messages.upsert fired");
 
     for (const msg of messages) {
       const jid = msg.key.remoteJid;
@@ -160,7 +184,6 @@ async function start() {
       if (msg.key.fromMe) continue;
       if (!msg.message) continue;
 
-      // For history-sync messages, skip if older than 3 minutes
       if (type === "append") {
         const msgTs = (msg.messageTimestamp as number ?? 0) * 1000;
         if (now - msgTs > RECENT_MS) continue;
@@ -171,11 +194,13 @@ async function start() {
         msg.message.extendedTextMessage?.text ??
         "";
 
+      // Log every message we see (first 80 chars) — helps trace drops
+      log.info({ jid: jid.slice(-20), type, textLen: text.length, preview: text.slice(0, 80) }, "👁 message seen");
+
       if (!text.trim()) continue;
 
       try {
         if (isJidUser(jid) || isLidUser(jid)) {
-          // Extract identifier: phone number for @s.whatsapp.net, lid for @lid
           const waPhone = isLidUser(jid)
             ? jid.replace("@lid", "")
             : jid.replace("@s.whatsapp.net", "").replace(/\D/g, "");
