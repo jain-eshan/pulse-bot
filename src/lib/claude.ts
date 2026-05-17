@@ -18,7 +18,7 @@ export type ParsedSession = {
  *
  * Required env vars:
  *   ANTHROPIC_PARSE_URL  = https://<project>.supabase.co/functions/v1/parse-session
- *   ANTHROPIC_PARSE_KEY  = sb_publishable_<key>   (Supabase anon/publishable key)
+ *   ANTHROPIC_PARSE_KEY  = eyJ...   (Supabase JWT anon key — NOT sb_publishable_)
  */
 export async function parseSession(text: string): Promise<ParsedSession | null> {
   const url = process.env.ANTHROPIC_PARSE_URL;
@@ -40,7 +40,8 @@ export async function parseSession(text: string): Promise<ParsedSession | null> 
     });
 
     if (!r.ok) {
-      log.warn({ status: r.status }, "parse-session edge function returned non-200");
+      const errBody = await r.text().catch(() => "(unreadable)");
+      log.warn({ status: r.status, errBody: errBody.slice(0, 300) }, "parse-session edge function returned non-200");
       return null;
     }
 

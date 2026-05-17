@@ -72,15 +72,25 @@ export async function handleGroupMessage(
 ) {
   const groupJid = msg.key.remoteJid!;
   const senderJid = msg.key.participant ?? msg.key.remoteJid!;
+  const m = msg.message;
   const text =
-    msg.message?.conversation ??
-    msg.message?.extendedTextMessage?.text ??
+    m?.conversation ??
+    m?.extendedTextMessage?.text ??
+    m?.imageMessage?.caption ??
+    m?.videoMessage?.caption ??
+    m?.documentMessage?.caption ??
+    m?.ephemeralMessage?.message?.conversation ??
+    m?.ephemeralMessage?.message?.extendedTextMessage?.text ??
+    m?.ephemeralMessage?.message?.imageMessage?.caption ??
+    m?.viewOnceMessage?.message?.conversation ??
+    m?.viewOnceMessage?.message?.extendedTextMessage?.text ??
+    m?.viewOnceMessage?.message?.imageMessage?.caption ??
     "";
 
   // Allow image-only messages (caption may be empty) — check for image presence too
   const hasImage = !!(
-    msg.message?.imageMessage ??
-    msg.message?.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage
+    m?.imageMessage ??
+    m?.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage
   );
 
   if (!text && !hasImage) return;

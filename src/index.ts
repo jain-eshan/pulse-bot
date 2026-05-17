@@ -23,6 +23,8 @@ let botConnected = false;
 let lastEventAt: number = Date.now(); // tracks last WA activity (message or ping)
 let reconnectAttempts = 0;
 let watchdogTimer: ReturnType<typeof setInterval> | null = null;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let activeSock: ReturnType<typeof makeWASocket> | null = null;
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
 
@@ -85,8 +87,17 @@ http.createServer(async (req, res) => {
 
 // ── Reconnect helpers ─────────────────────────────────────────────────────────
 function scheduleReconnect(delaySecs: number) {
+  // Cancel any already-scheduled reconnect to prevent multiple start() calls
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
   log.info({ delaySecs, reconnectAttempts }, `Reconnecting in ${delaySecs}s…`);
-  setTimeout(() => { reconnectAttempts++; start(); }, delaySecs * 1000);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    reconnectAttempts++;
+    start();
+  }, delaySecs * 1000);
 }
 
 function startWatchdog(sock: ReturnType<typeof makeWASocket>) {
@@ -106,6 +117,12 @@ function startWatchdog(sock: ReturnType<typeof makeWASocket>) {
 
 // ── Main bot ──────────────────────────────────────────────────────────────────
 async function start() {
+  // Clean up previous socket to prevent multiple connections fighting
+  if (activeSock) {
+    try { activeSock.end(undefined); } catch { /* ignore */ }
+    activeSock = null;
+  }
+
   const { state, saveCreds } = process.env.SUPABASE_URL
     ? await useSupabaseAuthState()
     : await useMultiFileAuthState("auth");
@@ -122,6 +139,7 @@ async function start() {
     keepAliveIntervalMs: 15_000,
   });
 
+  activeSock = sock;
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
