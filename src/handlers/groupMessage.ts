@@ -4,6 +4,7 @@ import { supabase } from "../lib/supabase.js";
 import { looksLikeSessionAnnouncement } from "../lib/parser.js";
 import { parseSession, type ParsedSession } from "../lib/claude.js";
 import { log } from "../lib/logger.js";
+import { isTextDuplicate, isSenderOnCooldown, findSemanticDuplicate } from "../lib/dedup.js";
 import crypto from "crypto";
 
 const APP_URL = "https://pulse-isb.vercel.app";
@@ -98,6 +99,12 @@ export async function handleGroupMessage(
 
   log.info({ groupJid, senderJid, preview: text.slice(0, 80) }, "📅 announcement detected");
 
+  // ── Dedup Layer 1: Text fingerprint (skip if same text seen in 6h) ────────
+  if (text && isTextDuplicate(text)) return;
+
+  // ── Dedup Layer 2: Sender cooldown (skip if same sender triggered in 5m) ──
+  if (isSenderOnCooldown(senderJid)) return;
+
   // 1. React 📅 in the group (silent visual signal)
   try {
     await sock.sendMessage(groupJid, {
@@ -115,6 +122,13 @@ export async function handleGroupMessage(
 
   if (!parsed) {
     log.info("parse-session returned null — skipping DM");
+    return;
+  }
+
+  // ── Dedup Layer 3: Semantic match (skip if similar event already exists) ──
+  const existingId = await findSemanticDuplicate(parsed.title, parsed.starts_at);
+  if (existingId) {
+    log.info({ existingId, title: parsed.title }, "🔄 dedup: event already exists — skipping DM");
     return;
   }
 
