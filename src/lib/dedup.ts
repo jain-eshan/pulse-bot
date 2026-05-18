@@ -3,16 +3,21 @@
  * multiple events when shared across WhatsApp groups.
  *
  * Three layers:
- *   1. Text fingerprint: hash of first 200 chars → skip if seen in 6h
+ *   1. Text fingerprint: hash of first 200 chars → skip if seen in 48h
  *   2. Sender cooldown: same JID can't trigger parse within 5 min
- *   3. Semantic dedup: after parse, check sessions table for same date ± 2h + similar title
+ *   3. Semantic dedup: after parse, check sessions + bot_dedup_log for
+ *      same date ± 2h + similar title. Covers multi-day reminders because
+ *      the dedup log persists 7 days in Supabase.
+ *
+ * After a successful parse, call `recordProcessedEvent()` to write to
+ * the persistent dedup log so reminders days later are still caught.
  */
 
 import crypto from "crypto";
 import { supabase } from "./supabase.js";
 import { log } from "./logger.js";
 
-// ── In-memory caches (reset on container restart — fine for dedup) ──────────
+// ── In-memory caches (fast path — reset on container restart) ───────────────
 
 /** Map<textHash, timestamp> — recently seen message fingerprints */
 const seenTexts = new Map<string, number>();
@@ -20,7 +25,7 @@ const seenTexts = new Map<string, number>();
 /** Map<senderJid, timestamp> — last time this sender triggered a parse */
 const senderCooldowns = new Map<string, number>();
 
-const TEXT_DEDUP_WINDOW_MS = 6 * 60 * 60 * 1000;   // 6 hours
+const TEXT_DEDUP_WINDOW_MS = 48 * 60 * 60 * 1000;  // 48 hours (covers day-before reminders)
 const SENDER_COOLDOWN_MS  = 5 * 60 * 1000;          // 5 minutes
 const SEMANTIC_WINDOW_HOURS = 2;                     // ±2h for date match
 
@@ -82,9 +87,14 @@ export function isSenderOnCooldown(senderJid: string): boolean {
 
 /**
  * After the LLM has parsed an event, check if a session with the same
- * date (±2 hours) and similar title already exists in the DB.
+ * date (±2 hours) and similar title already exists.
  *
- * Returns the existing session ID if a duplicate is found, null otherwise.
+ * Checks three sources:
+ *   - Published sessions (sessions table)
+ *   - Pending bot confirms (bot_pending_confirms — 15 min TTL)
+ *   - Persistent dedup log (bot_dedup_log — 7 day TTL, survives restarts)
+ *
+ * Returns the existing session/log ID if a duplicate is found, null otherwise.
  */
 export async function findSemanticDuplicate(
   title: string,
@@ -99,37 +109,48 @@ export async function findSemanticDuplicate(
     const windowStart = new Date(eventTime.getTime() - SEMANTIC_WINDOW_HOURS * 60 * 60 * 1000).toISOString();
     const windowEnd = new Date(eventTime.getTime() + SEMANTIC_WINDOW_HOURS * 60 * 60 * 1000).toISOString();
 
-    // Fetch sessions in the time window
-    const { data: candidates } = await supabase
-      .from("sessions")
-      .select("id, title")
-      .gte("starts_at", windowStart)
-      .lte("starts_at", windowEnd)
-      .eq("archived", false);
-
-    if (!candidates || candidates.length === 0) return null;
-
-    // Also check pending confirms (events not yet published)
-    const { data: pending } = await supabase
-      .from("bot_pending_confirms")
-      .select("parsed_payload")
-      .gte("expires_at", new Date().toISOString());
+    // Fetch from all three sources in parallel
+    const [sessionsRes, pendingRes, dedupLogRes] = await Promise.all([
+      supabase
+        .from("sessions")
+        .select("id, title")
+        .gte("starts_at", windowStart)
+        .lte("starts_at", windowEnd)
+        .eq("archived", false),
+      supabase
+        .from("bot_pending_confirms")
+        .select("parsed_payload")
+        .gte("expires_at", new Date().toISOString()),
+      supabase
+        .from("bot_dedup_log")
+        .select("id, title")
+        .gte("starts_at", windowStart)
+        .lte("starts_at", windowEnd)
+        .gte("expires_at", new Date().toISOString()),
+    ]);
 
     const allTitles: { id: string; title: string }[] = [
-      ...candidates,
-      ...(pending ?? [])
+      ...(sessionsRes.data ?? []),
+      ...(pendingRes.data ?? [])
         .map((p: any) => ({
           id: "pending",
           title: p.parsed_payload?.title ?? "",
         }))
         .filter((p: { title: string }) => p.title),
+      ...(dedupLogRes.data ?? []).map((d: any) => ({
+        id: `dedup-${d.id}`,
+        title: d.title,
+      })),
     ];
+
+    if (allTitles.length === 0) return null;
 
     // Fuzzy title match: normalized substring containment or high overlap
     const normTitle = normalize(title);
 
     for (const candidate of allTitles) {
       const normCandidate = normalize(candidate.title);
+      if (!normCandidate) continue;
 
       // Exact match after normalization
       if (normTitle === normCandidate) {
@@ -154,6 +175,42 @@ export async function findSemanticDuplicate(
   } catch (err) {
     log.warn({ err }, "dedup: semantic check failed — allowing event");
     return null;
+  }
+}
+
+// ── Persistent dedup log ────────────────────────────────────────────────────
+
+/**
+ * Record that the bot has processed an event. Called after successful parse,
+ * regardless of whether the sender confirms it. This ensures reminders
+ * sent days later are caught by Layer 3.
+ */
+export async function recordProcessedEvent(title: string, startsAt: string): Promise<void> {
+  try {
+    const eventHash = crypto
+      .createHash("sha256")
+      .update(normalize(title) + "|" + startsAt)
+      .digest("hex")
+      .slice(0, 24);
+
+    // Check if already recorded (avoid duplicating the log entry itself)
+    const { data: existing } = await supabase
+      .from("bot_dedup_log")
+      .select("id")
+      .eq("event_hash", eventHash)
+      .maybeSingle();
+
+    if (existing) return;
+
+    await supabase.from("bot_dedup_log").insert({
+      event_hash: eventHash,
+      title,
+      starts_at: startsAt,
+    });
+
+    log.info({ eventHash, title }, "📝 dedup: recorded event in persistent log");
+  } catch (err) {
+    log.warn({ err }, "dedup: failed to write dedup log — non-fatal");
   }
 }
 

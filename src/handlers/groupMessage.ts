@@ -4,23 +4,51 @@ import { supabase } from "../lib/supabase.js";
 import { looksLikeSessionAnnouncement } from "../lib/parser.js";
 import { parseSession, type ParsedSession } from "../lib/claude.js";
 import { log } from "../lib/logger.js";
-import { isTextDuplicate, isSenderOnCooldown, findSemanticDuplicate } from "../lib/dedup.js";
+import { isTextDuplicate, isSenderOnCooldown, findSemanticDuplicate, recordProcessedEvent } from "../lib/dedup.js";
 import crypto from "crypto";
 
 const APP_URL = "https://pulse-isb.vercel.app";
 const TTL_MS = 15 * 60 * 1000; // 15 minutes
 
-// ── Image helpers ────────────────────────────────────────────────────────────
+// ── Media helpers ────────────────────────────────────────────────────────────
 
-async function extractImageUrl(
+interface MediaAsset {
+  url: string;
+  type: "image" | "video" | "document";
+  mimetype?: string;
+  filename?: string;
+}
+
+function detectMediaType(msg: proto.IWebMessageInfo): {
+  kind: "image" | "video" | "document" | null;
+  mimetype?: string;
+  filename?: string;
+} {
+  const m = msg.message;
+  if (m?.imageMessage) return { kind: "image", mimetype: m.imageMessage.mimetype ?? "image/jpeg" };
+  if (m?.videoMessage) return { kind: "video", mimetype: m.videoMessage.mimetype ?? "video/mp4" };
+  if (m?.documentMessage) return {
+    kind: "document",
+    mimetype: m.documentMessage.mimetype ?? "application/pdf",
+    filename: m.documentMessage.fileName ?? undefined,
+  };
+  // Check quoted message for image
+  if (m?.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage) return { kind: "image", mimetype: "image/jpeg" };
+  return { kind: null };
+}
+
+const MIME_TO_EXT: Record<string, string> = {
+  "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp",
+  "video/mp4": "mp4", "video/3gpp": "3gp",
+  "application/pdf": "pdf",
+};
+
+async function extractMedia(
   sock: WASocket,
   msg: proto.IWebMessageInfo
-): Promise<string | null> {
-  const imageMsg =
-    msg.message?.imageMessage ??
-    msg.message?.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage;
-
-  if (!imageMsg) return null;
+): Promise<MediaAsset | null> {
+  const { kind, mimetype, filename } = detectMediaType(msg);
+  if (!kind) return null;
 
   try {
     const buffer = await downloadMediaMessage(
@@ -30,20 +58,28 @@ async function extractImageUrl(
       { logger: log.child({ module: "download" }) as any, reuploadRequest: sock.updateMediaMessage }
     ) as Buffer;
 
-    const filename = `wa-covers/${Date.now()}-${crypto.randomBytes(4).toString("hex")}.jpg`;
+    const ext = MIME_TO_EXT[mimetype ?? ""] ?? "bin";
+    const storagePath = `wa-covers/${Date.now()}-${crypto.randomBytes(4).toString("hex")}.${ext}`;
+
     const { data, error } = await supabase.storage
       .from("session-covers")
-      .upload(filename, buffer, { contentType: "image/jpeg", upsert: false });
+      .upload(storagePath, buffer, { contentType: mimetype ?? "application/octet-stream", upsert: false });
 
     if (error || !data) {
-      log.warn({ error }, "Failed to upload WA image to Supabase Storage");
+      log.warn({ error, kind }, "Failed to upload WA media to Supabase Storage");
       return null;
     }
 
     const { data: urlData } = supabase.storage.from("session-covers").getPublicUrl(data.path);
-    return urlData.publicUrl;
+    log.info({ kind, mimetype, path: data.path }, "📎 media uploaded");
+    return {
+      url: urlData.publicUrl,
+      type: kind,
+      mimetype: mimetype ?? undefined,
+      filename: filename ?? undefined,
+    };
   } catch (err) {
-    log.warn({ err }, "Image download/upload failed");
+    log.warn({ err, kind }, "Media download/upload failed");
     return null;
   }
 }
@@ -88,13 +124,13 @@ export async function handleGroupMessage(
     m?.viewOnceMessage?.message?.imageMessage?.caption ??
     "";
 
-  // Allow image-only messages (caption may be empty) — check for image presence too
-  const hasImage = !!(
-    m?.imageMessage ??
+  // Allow media-only messages (caption may be empty) — check for media presence too
+  const hasMedia = !!(
+    m?.imageMessage ?? m?.videoMessage ?? m?.documentMessage ??
     m?.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage
   );
 
-  if (!text && !hasImage) return;
+  if (!text && !hasMedia) return;
   if (text && !looksLikeSessionAnnouncement(text)) return;
 
   log.info({ groupJid, senderJid, preview: text.slice(0, 80) }, "📅 announcement detected");
@@ -114,10 +150,10 @@ export async function handleGroupMessage(
     log.warn({ err }, "failed to react with 📅");
   }
 
-  // 2. Download image if present (do in parallel with parse)
-  const [parsed, imageUrl] = await Promise.all([
+  // 2. Download media if present (do in parallel with parse)
+  const [parsed, media] = await Promise.all([
     parseSession(text),
-    extractImageUrl(sock, msg),
+    extractMedia(sock, msg),
   ]);
 
   if (!parsed) {
@@ -132,8 +168,22 @@ export async function handleGroupMessage(
     return;
   }
 
-  if (imageUrl) {
-    parsed.image_url = imageUrl;
+  // Record in persistent dedup log so day-later reminders are caught
+  await recordProcessedEvent(parsed.title, parsed.starts_at);
+
+  // Attach media to parsed event
+  if (media) {
+    if (media.type === "image") {
+      parsed.image_url = media.url;
+    }
+    // Store all media types in attachments array
+    parsed.attachments = parsed.attachments ?? [];
+    parsed.attachments.push({
+      url: media.url,
+      type: media.type,
+      mimetype: media.mimetype,
+      filename: media.filename,
+    });
   }
 
   // 3. Look up sender — linked or not?
@@ -154,7 +204,7 @@ export async function handleGroupMessage(
       sender_jid: senderJid,
       group_jid: groupJid,
       source_text: text,
-      parsed_payload: { ...parsed, image_url: imageUrl ?? undefined },
+      parsed_payload: parsed,
       expires_at: new Date(Date.now() + TTL_MS).toISOString(),
     });
 
@@ -176,7 +226,7 @@ export async function handleGroupMessage(
     }
 
     // Store the draft so the web app can pre-fill the form
-    const draftUrl = await createDraftLink(parsed, imageUrl, senderJid);
+    const draftUrl = await createDraftLink(parsed, parsed.image_url ?? null, senderJid);
 
     await supabase.from("bot_dm_pitches").insert({
       jid: senderJid,

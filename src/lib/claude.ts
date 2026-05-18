@@ -1,5 +1,12 @@
 import { log } from "./logger.js";
 
+export interface MediaAttachment {
+  url: string;
+  type: "image" | "video" | "document";
+  mimetype?: string;
+  filename?: string;
+}
+
 export type ParsedSession = {
   title: string;
   description: string;
@@ -9,7 +16,8 @@ export type ParsedSession = {
   category: "Sports" | "Social" | "Professional" | "";
   subcategory: string;
   tags: string[];
-  image_url?: string;     // populated by caller if WhatsApp image detected
+  image_url?: string;           // cover image (first image attachment)
+  attachments?: MediaAttachment[]; // all media: images, videos, PDFs
 };
 
 /**
